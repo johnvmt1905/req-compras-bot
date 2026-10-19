@@ -1,11 +1,6 @@
 const { google } = require('googleapis');
-const { configuracaoAmbiente } = require('../config/environment');
 
-function spreadsheetIdPara(ambiente) {
-  const id = configuracaoAmbiente(ambiente).spreadsheetId;
-  if (!id) throw new Error(`Planilha não configurada para o ambiente ${ambiente || 'producao'}`);
-  return id;
-}
+const SPREADSHEET_ID = process.env.SHEETS_SPREADSHEET_ID;
 
 // Formata a data atual no padrão brasileiro: dd/mm/yyyy - hh:mm
 // Prefixo de apóstrofo força o Google Sheets a tratar como TEXTO puro,
@@ -38,9 +33,8 @@ async function getSheetsClient() {
 // L=Código Omie, M=NCM, N=Similaridade%, O=Status, P=Aprovado por,
 // Q=Data Aprovação, R=Observação, S=Cliente, T=Máquina/Subconjunto,
 // U=Prazo Entrega, V=Nº Pedido Omie, W=Slack Message TS, X=Slack Channel
-async function registrarItens(idRequisicao, itensProcessados, slackMessageTs, slackChannel, ambiente = 'producao') {
+async function registrarItens(idRequisicao, itensProcessados, slackMessageTs, slackChannel) {
   const sheets = await getSheetsClient();
-  const SPREADSHEET_ID = spreadsheetIdPara(ambiente);
 
   const linhas = itensProcessados.map((item) => [
     item.id_item,
@@ -52,7 +46,7 @@ async function registrarItens(idRequisicao, itensProcessados, slackMessageTs, sl
     item.descricao_norm || '',
     item.quantidade,
     item.unidade,
-    item.num_tarefa || item.subconjunto || item.maquina || item.projeto || '',
+    item.num_tarefa || item.subconjunto || '',
     item.produto_omie?.descricao || '',
     item.produto_omie?.codigo    || '',
     item.produto_omie?.ncm       || '',
@@ -62,7 +56,7 @@ async function registrarItens(idRequisicao, itensProcessados, slackMessageTs, sl
     '', // Data aprovação (col Q)
     item.observacao || '',   // col R
     item.cliente     || '',  // col S
-    item.maquina || item.projeto || item.subconjunto || '', // col T
+    item.maquina || item.subconjunto || '', // col T
     '', // Prazo Entrega (col U — preenchido na cotação)
     '', // Nº Pedido Omie (col V — preenchido na cotação)
     slackMessageTs || '', // col W
@@ -78,16 +72,14 @@ async function registrarItens(idRequisicao, itensProcessados, slackMessageTs, sl
 }
 
 // Registra requisição no Histórico
-async function registrarHistorico(idRequisicao, area, solicitante, itensProcessados, ambiente = 'producao') {
+async function registrarHistorico(idRequisicao, area, solicitante, itensProcessados) {
   const sheets = await getSheetsClient();
-  const SPREADSHEET_ID = spreadsheetIdPara(ambiente);
 
   const confirmados = itensProcessados.filter(i => i.status === 'confirmado').length;
-  const revisao     = itensProcessados.filter(i => i.status === 'aguardando_revisao').length;
   const aprovacao   = itensProcessados.filter(i => i.status === 'aguardando_aprovacao').length;
   const cadastro    = itensProcessados.filter(i => i.status === 'aguardando_cadastro').length;
   const total       = itensProcessados.length;
-  const statusReq   = (revisao + aprovacao + cadastro) > 0 ? 'Em andamento' : 'Pronta para Omie';
+  const statusReq   = (aprovacao + cadastro) > 0 ? 'Em andamento' : 'Pronta para Omie';
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
@@ -112,9 +104,8 @@ async function registrarHistorico(idRequisicao, area, solicitante, itensProcessa
 
 // Busca os dados de cache do Slack para um item (message_ts e channel)
 // Usado pelo bot.js para atualizar a mensagem original sem depender do cache em memória
-async function buscarDadosSlackItem(idItem, ambiente = 'producao') {
+async function buscarDadosSlackItem(idItem) {
   const sheets = await getSheetsClient();
-  const SPREADSHEET_ID = spreadsheetIdPara(ambiente);
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -134,9 +125,8 @@ async function buscarDadosSlackItem(idItem, ambiente = 'producao') {
 // Atualiza status de um item na aba Itens.
 // Retorna { idRequisicao, todosRevisados } para o bot.js decidir se deve
 // mostrar o botão "Iniciar Cotação" na mensagem.
-async function atualizarStatusItem(idItem, novoStatus, aprovadoPor, produtoOmie = null, ambiente = 'producao') {
+async function atualizarStatusItem(idItem, novoStatus, aprovadoPor) {
   const sheets = await getSheetsClient();
-  const SPREADSHEET_ID = spreadsheetIdPara(ambiente);
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -150,33 +140,21 @@ async function atualizarStatusItem(idItem, novoStatus, aprovadoPor, produtoOmie 
   const excelRow = rowIndex + 1;
   const idRequisicao = rows[rowIndex][1];
 
-  const data = [
-    { range: `Itens!O${excelRow}`, values: [[statusLabel(novoStatus)]] },
-    { range: `Itens!P${excelRow}`, values: [[aprovadoPor || '']] },
-    { range: `Itens!Q${excelRow}`, values: [[formatarDataBR()]] },
-  ];
-
-  // Persiste o produto efetivamente escolhido/cadastrado. Esses campos são
-  // a fonte usada mais tarde para montar os itens do pedido de compra.
-  if (produtoOmie) {
-    data.push(
-      { range: `Itens!K${excelRow}`, values: [[produtoOmie.descricao || '']] },
-      { range: `Itens!L${excelRow}`, values: [[produtoOmie.codigo_omie || '']] },
-      { range: `Itens!M${excelRow}`, values: [[produtoOmie.ncm || '']] },
-    );
-  }
-
   await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
     resource: {
       valueInputOption: 'USER_ENTERED',
-      data,
+      data: [
+        { range: `Itens!O${excelRow}`, values: [[statusLabel(novoStatus)]] },
+        { range: `Itens!P${excelRow}`, values: [[aprovadoPor || '']] },
+        { range: `Itens!Q${excelRow}`, values: [[formatarDataBR()]] },
+      ],
     },
   });
 
   let todosRevisados = false;
   if (idRequisicao) {
-    todosRevisados = await recalcularHistorico(idRequisicao, ambiente);
+    todosRevisados = await recalcularHistorico(idRequisicao);
   }
 
   return { idRequisicao, todosRevisados };
@@ -185,9 +163,8 @@ async function atualizarStatusItem(idItem, novoStatus, aprovadoPor, produtoOmie 
 // Recalcula os contadores de uma requisição no Histórico com base no estado atual dos Itens.
 // Retorna true se todos os itens já foram revisados (Confirmado ou Cadastrado),
 // indicando que a requisição está pronta para o botão "Iniciar Cotação".
-async function recalcularHistorico(idRequisicao, ambiente = 'producao') {
+async function recalcularHistorico(idRequisicao) {
   const sheets = await getSheetsClient();
-  const SPREADSHEET_ID = spreadsheetIdPara(ambiente);
 
   const resItens = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -249,9 +226,8 @@ function statusLabel(status) {
 
 // Busca os dados de um item da planilha para reconstituir o modal
 // quando o cache em memória foi perdido (restart do servidor)
-async function buscarItemParaModal(idItem, ambiente = 'producao') {
+async function buscarItemParaModal(idItem) {
   const sheets = await getSheetsClient();
-  const SPREADSHEET_ID = spreadsheetIdPara(ambiente);
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -275,7 +251,6 @@ async function buscarItemParaModal(idItem, ambiente = 'producao') {
     num_tarefa:  row[2] === 'AT'          ? row[9] : '',
     cliente:     row[18] || '',
     maquina:     row[19] || '',
-    observacao:  row[17] || '',
     // opcoes_similares vazio — o comprador terá que buscar manualmente
     // se o cache foi perdido, mas pelo menos o modal abre
     opcoes_similares: [],
@@ -288,9 +263,8 @@ async function buscarItemParaModal(idItem, ambiente = 'producao') {
 
 // Atualiza as colunas W (Slack TS) e X (Slack Channel) de todos os itens
 // de uma requisição — chamado após o envio da mensagem no Slack
-async function atualizarSlackCacheItens(idRequisicao, messageTs, channel, ambiente = 'producao') {
+async function atualizarSlackCacheItens(idRequisicao, messageTs, channel) {
   const sheets = await getSheetsClient();
-  const SPREADSHEET_ID = spreadsheetIdPara(ambiente);
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -318,9 +292,8 @@ async function atualizarSlackCacheItens(idRequisicao, messageTs, channel, ambien
 
 // Busca todos os itens de uma requisição já confirmados/cadastrados,
 // usado para montar o Modal 1 de cotação (preço por item)
-async function buscarItensDaRequisicao(idRequisicao, ambiente = 'producao') {
+async function buscarItensDaRequisicao(idRequisicao) {
   const sheets = await getSheetsClient();
-  const SPREADSHEET_ID = spreadsheetIdPara(ambiente);
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -342,9 +315,8 @@ async function buscarItensDaRequisicao(idRequisicao, ambiente = 'producao') {
 }
 
 // Atualiza o status de uma requisição no Histórico — chamado após criar pedidos no Omie
-async function atualizarStatusHistorico(idRequisicao, novoStatus, ambiente = 'producao') {
+async function atualizarStatusHistorico(idRequisicao, novoStatus) {
   const sheets = await getSheetsClient();
-  const SPREADSHEET_ID = spreadsheetIdPara(ambiente);
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
