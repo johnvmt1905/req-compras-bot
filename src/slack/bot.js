@@ -619,7 +619,7 @@ app.view('modal_precos_submit', async ({ ack, view, body, client }) => {
     return;
   }
 
-  // Inicializa o estado de cotação no cache
+  // Inicializa o estado de cotação no cache ANTES do ack para que montarViewModal2 funcione
   cotacaoCache.set(metadata.id_requisicao, {
     itens_pendentes: itensComPreco,
     grupos: [],
@@ -627,15 +627,17 @@ app.view('modal_precos_submit', async ({ ack, view, body, client }) => {
     message_ts: metadata.message_ts,
   });
 
-  console.log(`[COTAÇÃO] Preços confirmados para ${metadata.id_requisicao} por ${body.user.name}`);
-  itensComPreco.forEach(i => console.log(`  → ${i.descricao}: R$ ${i.preco_unitario.toFixed(2)}`));
-
-  // response_action: 'update' substitui o Modal de Preços pelo Modal 2
-  // em vez de empilhá-lo — evita o loop de voltar para o modal anterior
+  // ack() imediato — Slack exige resposta em até 3 segundos.
+  // Usamos response_action:'update' direto no ack para trocar o modal
+  // sem chamar client.views.update depois (evita race condition).
   await ack({
     response_action: 'update',
     view: montarViewModal2(metadata.id_requisicao),
   });
+
+  // Log DEPOIS do ack para não atrasar a resposta ao Slack
+  console.log(`[COTAÇÃO] Preços confirmados para ${metadata.id_requisicao} por ${body.user.name}`);
+  itensComPreco.forEach(i => console.log(`  → ${i.descricao}: R$ ${i.preco_unitario.toFixed(2)}`));
 });
 
 // ── Monta a view do Modal 2 — agrupamento por fornecedor ────────
