@@ -1,3 +1,8 @@
 node_modules/
 .env
 credentials.json
+data/
+*.json
+!package.json
+!package-lock.json
+!src/data/ncm.json

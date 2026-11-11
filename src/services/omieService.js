@@ -1,438 +1,333 @@
 const crypto = require('crypto');
+const { criarCacheAssincrono, mapearComConcorrencia, esperar } = require('../utils/cache');
 
 const OMIE_BASE_URL = 'https://app.omie.com.br/api/v1/';
 const OMIE_ENDPOINTS = {
-  produtos:    'geral/produtos/',
-  clientes:    'geral/clientes/',
+  produtos:     'geral/produtos/',
+  clientes:     'geral/clientes/',
   pedidocompra: 'produtos/pedidocompra/',
-  condicoes:   'produtos/formaspagcompras/',
+  condicoes:    'produtos/formaspagcompras/',
 };
-const APP_KEY    = process.env.OMIE_APP_KEY;
-const APP_SECRET = process.env.OMIE_APP_SECRET;
 
-// ── Contador VN em memória ───────────────────────────────────
-// O contador fica em memória durante a execução — sem escrita em disco,
-// sem acionar restart do nodemon. Na inicialização do servidor, o valor
-// é obtido diretamente do Omie (maior VN existente) para garantir que
-// não há conflito mesmo após reinicializações.
-// Valor -1 = ainda não inicializado (inicialização lazy na primeira chamada).
-let contadorVN = -1;
-const VN_INICIO = 8219; // fallback caso o Omie não tenha nenhum VN cadastrado
+const TIMEOUT_MS = 30_000;
+const CACHE_TTL_MS = 30 * 60 * 1000;     // catálogo/fornecedores mudam pouco
+const CONCORRENCIA_PAGINAS = 3;          // páginas buscadas em paralelo (respeita limites do Omie)
 
-async function inicializarContadorVN() {
-  if (contadorVN >= 0) return; // já inicializado
+const OMIE_COD_CC    = 9964712606;       // Itaú Unibanco
+const OMIE_COD_CATEG = '2.01.03';        // Compras de Matéria Prima
+const VN_INICIO      = 8219;             // fallback se o Omie não tiver nenhum VN
 
-  try {
-    const catalogo = await carregarCatalogoCompleto();
-    const vns = catalogo
-      .map(p => p.codigo || '')
-      .filter(c => /^VN\s*\d{1,4}$/i.test(c.trim())) // só VN com até 4 dígitos — ignora outliers como VN 9500001
-      .map(c => parseInt(c.replace(/[^0-9]/g, ''), 10))
-      .filter(n => !isNaN(n));
-
-    contadorVN = vns.length > 0 ? Math.max(...vns) : VN_INICIO;
-    console.log(`[OMIE] Contador VN inicializado em: ${contadorVN}`);
-  } catch (err) {
-    contadorVN = VN_INICIO;
-    console.warn(`[OMIE] Não foi possível inicializar contador VN pelo Omie, usando ${VN_INICIO}:`, err.message);
+class OmieError extends Error {
+  constructor(call, mensagem, { transitorio = false } = {}) {
+    super(`Erro Omie [${call}]: ${mensagem}`);
+    this.name = 'OmieError';
+    this.transitorio = transitorio;
   }
 }
 
-async function gerarProximoCodigoVN(maxTentativas = 5) {
-  await inicializarContadorVN();
-
-  for (let i = 0; i < maxTentativas; i++) {
-    contadorVN += 1;
-    const codigo = `VN ${contadorVN}`;
-
-    const existe = await verificarCodigoExiste(codigo);
-    if (!existe) {
-      console.log(`[OMIE] Próximo código VN gerado: ${codigo}`);
-      return codigo;
-    }
-
-    console.log(`[OMIE] Código ${codigo} já existe, tentando próximo...`);
-  }
-
-  throw new Error(`Não foi possível gerar um código VN disponível após ${maxTentativas} tentativas.`);
-}
-
-// Verifica se um código de produto já existe no Omie
-async function verificarCodigoExiste(codigo) {
-  try {
-    await chamarOmie('ConsultarProduto', { codigo });
-    return true; // se não lançou erro, produto existe
-  } catch (err) {
-    // Omie retorna erro específico quando produto não existe
-    if (err.message.includes('não encontrado') || err.message.includes('nao encontrado') || err.message.includes('PROD_NAO_ENCONTRADO')) {
-      return false;
-    }
-    // Qualquer outro erro — assume que não existe para não travar o fluxo
-    return false;
-  }
-}
-
-// Cadastra um produto novo no Omie e invalida o cache de catálogo.
-// Retorna { ok: true, codigo, codigo_omie, descricao } em caso de sucesso.
-// Retorna { ok: false, motivo } em caso de erro de negócio esperado
-// (ex: descrição duplicada) — sem lançar exceção para não derrubar o processo.
-async function incluirProduto({ descricao, ncm, unidade, observacao }) {
-  const codigo = await gerarProximoCodigoVN();
-
-  const param = {
-    codigo_produto_integracao: `REQ-${codigo.replace(' ', '')}`,
-    codigo,
-    descricao,
-    unidade:      unidade || 'PC',
-    ncm:          ncm     || '',
-    obs_internas: observacao || 'Cadastrado via sistema de requisições GZero',
-  };
-
-  try {
-    const resultado = await chamarOmie('IncluirProduto', param);
-    invalidarCache();
-    console.log(`[OMIE] Produto cadastrado: ${codigo} — ${descricao}`);
-    return { ok: true, codigo, codigo_omie: resultado.codigo_produto, descricao };
-  } catch (err) {
-    const msg = err.message || '';
-
-    // Descrição já usada por outro produto — erro de negócio, não técnico
-    if (msg.includes('descrição informada já está sendo utilizada') || msg.includes('descricao')) {
-      console.warn(`[OMIE] Descrição já cadastrada: "${descricao}" — produto não criado.`);
-      return { ok: false, motivo: 'descricao_duplicada', descricao };
-    }
-
-    // Qualquer outro erro — loga e retorna falha sem lançar
-    console.error(`[OMIE] Erro ao incluir produto "${descricao}":`, msg);
-    return { ok: false, motivo: 'erro_omie', detalhe: msg };
-  }
-}
-
-// Cache em memória do catálogo completo — evita repaginar a API do Omie
-// em toda requisição. Atualizado sob demanda (ver invalidarCache).
-// Estrutura: { produtos: [...], carregadoEm: timestamp }
-let cacheProdutos = null;
-const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutos — catálogo não muda a cada segundo
-
-async function chamarOmie(call, param, endpointKey = 'produtos') {
-  if (!APP_KEY || !APP_SECRET) {
+// ── Cliente HTTP ─────────────────────────────────────────────
+// `tentativas` > 1 só deve ser usado em chamadas de leitura: repetir uma
+// escrita (IncluirProduto/IncluirPedCompra) poderia duplicar registros.
+async function chamarOmie(call, param, endpointKey = 'produtos', { tentativas = 1 } = {}) {
+  const { OMIE_APP_KEY, OMIE_APP_SECRET } = process.env;
+  if (!OMIE_APP_KEY || !OMIE_APP_SECRET) {
     throw new Error('OMIE_APP_KEY / OMIE_APP_SECRET não configurados no .env');
   }
 
-  const url = OMIE_BASE_URL + (OMIE_ENDPOINTS[endpointKey] || OMIE_ENDPOINTS.produtos);
+  const url = OMIE_BASE_URL + OMIE_ENDPOINTS[endpointKey];
+  const body = JSON.stringify({ app_key: OMIE_APP_KEY, app_secret: OMIE_APP_SECRET, call, param: [param] });
 
+  for (let tentativa = 1; ; tentativa++) {
+    try {
+      return await requisicaoOmie(url, call, body);
+    } catch (err) {
+      const podeRepetir = tentativa < tentativas && (err.transitorio || err.name !== 'OmieError');
+      if (!podeRepetir) throw err;
+      console.warn(`[OMIE] ${call} falhou (tentativa ${tentativa}/${tentativas}): ${err.message}. Repetindo...`);
+      await esperar(1000 * 2 ** (tentativa - 1));
+    }
+  }
+}
+
+async function requisicaoOmie(url, call, body) {
   const resposta = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      app_key: APP_KEY,
-      app_secret: APP_SECRET,
-      call,
-      param: [param],
-    }),
+    body,
+    signal: AbortSignal.timeout(TIMEOUT_MS),
   });
 
-  const dados = await resposta.json();
-
-  if (dados.faultstring) {
-    // Omie retorna erro nesse formato mesmo com HTTP 200
-    throw new Error(`Erro Omie [${call}]: ${dados.faultstring}`);
+  const texto = await resposta.text();
+  let dados;
+  try {
+    dados = JSON.parse(texto);
+  } catch {
+    // Gateway fora do ar devolve HTML — erro transitório, vale repetir
+    throw new OmieError(call, `resposta inválida (HTTP ${resposta.status}): ${texto.slice(0, 200)}`, { transitorio: true });
   }
 
+  // O Omie devolve erros de negócio com HTTP 200/500 e campo faultstring
+  if (dados.faultstring) {
+    const transitorio = resposta.status === 429 || /REDUNDANT|consumo redundante|bloquead/i.test(dados.faultstring);
+    throw new OmieError(call, dados.faultstring, { transitorio });
+  }
+  if (!resposta.ok) {
+    throw new OmieError(call, `HTTP ${resposta.status}`, { transitorio: resposta.status >= 500 || resposta.status === 429 });
+  }
   return dados;
 }
 
-// Busca uma página de produtos no Omie
-async function listarProdutosPagina(pagina, registrosPorPagina = 500) {
-  return chamarOmie('ListarProdutos', {
+// Busca todas as páginas de uma listagem: a primeira define o total e as
+// restantes são buscadas em paralelo com concorrência limitada.
+async function listarTodasPaginas({ call, endpointKey, registrosPorPagina, chaveLista, paramExtra = {} }) {
+  const buscarPagina = (pagina) => chamarOmie(call, {
     pagina,
     registros_por_pagina: registrosPorPagina,
     apenas_importado_api: 'N',
-    filtrar_apenas_omiepdv: 'N',
+    ...paramExtra,
+  }, endpointKey, { tentativas: 3 });
+
+  const primeira = await buscarPagina(1);
+  const totalPaginas = primeira.total_de_paginas || 1;
+  const paginasRestantes = Array.from({ length: totalPaginas - 1 }, (_, i) => i + 2);
+  const demais = await mapearComConcorrencia(paginasRestantes, CONCORRENCIA_PAGINAS, buscarPagina);
+
+  return [primeira, ...demais].flatMap(r => r[chaveLista] || []);
+}
+
+// ── Catálogo de produtos ─────────────────────────────────────
+const cacheCatalogo = criarCacheAssincrono(async () => {
+  const produtos = await listarTodasPaginas({
+    call: 'ListarProdutos',
+    endpointKey: 'produtos',
+    registrosPorPagina: 500,
+    chaveLista: 'produto_servico_cadastro',
+    paramExtra: { filtrar_apenas_omiepdv: 'N' },
   });
-}
+  console.log(`[OMIE] Catálogo carregado: ${produtos.length} produtos.`);
+  return produtos;
+}, CACHE_TTL_MS);
 
-// Busca o catálogo completo, paginando até o fim. Usa cache para não
-// repetir isso toda hora — chamado uma vez e reaproveitado.
-// Promise singleton: se o carregamento já estiver em andamento,
-// requisições simultâneas aguardam o mesmo resultado em vez de
-// fazer chamadas paralelas ao Omie (que retornaria REDUNDANT).
-let carregandoPromise = null;
+const carregarCatalogoCompleto = (forcar = false) => cacheCatalogo.obter(forcar);
+const invalidarCache = () => cacheCatalogo.invalidar();
 
-async function carregarCatalogoCompleto(forcarAtualizacao = false) {
-  const agora = Date.now();
-
-  if (!forcarAtualizacao && cacheProdutos && (agora - cacheProdutos.carregadoEm) < CACHE_TTL_MS) {
-    return cacheProdutos.produtos;
-  }
-
-  // Se já há uma chamada em andamento, aguarda ela terminar
-  if (carregandoPromise) {
-    return carregandoPromise;
-  }
-
-  carregandoPromise = (async () => {
-    try {
-      let pagina = 1;
-      let totalPaginas = 1;
-      const todosProdutos = [];
-
-      do {
-        const resultado = await listarProdutosPagina(pagina);
-        const lista = resultado.produto_servico_cadastro || [];
-        todosProdutos.push(...lista);
-
-        totalPaginas = resultado.total_de_paginas || 1;
-        pagina += 1;
-      } while (pagina <= totalPaginas);
-
-      cacheProdutos = { produtos: todosProdutos, carregadoEm: Date.now() };
-      console.log(`[OMIE] Catálogo carregado: ${todosProdutos.length} produtos.`);
-      return todosProdutos;
-    } finally {
-      carregandoPromise = null; // libera para próxima chamada após TTL
-    }
-  })();
-
-  return carregandoPromise;
-}
-
-function invalidarCache() {
-  cacheProdutos = null;
-  carregandoPromise = null;
-}
-
-// Busca produtos do Omie que já têm NCM cadastrado e cuja descrição é
-// similar à fornecida. Usado para a primeira camada de sugestão de NCM
-// (histórico Omie), antes de cair para a tabela local.
-async function buscarNcmPorHistorico(descricaoNormalizada, normalizarFn, limiteSimilaridade = 0.5) {
-  const catalogo = await carregarCatalogoCompleto();
-
-  const candidatosComNcm = catalogo.filter(p => p.ncm && p.ncm.trim() !== '');
-  if (candidatosComNcm.length === 0) return null;
-
-  const palavrasBusca = descricaoNormalizada.split(' ').filter(p => p.length >= 3);
-  if (palavrasBusca.length === 0) return null;
-
-  let melhor = null;
-  let melhorPontos = 0;
-
-  candidatosComNcm.forEach(p => {
-    const descNorm = normalizarFn(p.descricao || '');
-    const palavrasItem = new Set(descNorm.split(' '));
-    let acertos = 0;
-    palavrasBusca.forEach(palavra => {
-      if (palavrasItem.has(palavra)) acertos += 1;
-    });
-    const pontos = acertos / palavrasBusca.length;
-    if (pontos > melhorPontos) {
-      melhorPontos = pontos;
-      melhor = p;
-    }
+// ── Fornecedores ─────────────────────────────────────────────
+// Clientes e fornecedores ficam no mesmo cadastro; filtra pela tag.
+const cacheFornecedores = criarCacheAssincrono(async () => {
+  const clientes = await listarTodasPaginas({
+    call: 'ListarClientes',
+    endpointKey: 'clientes',
+    registrosPorPagina: 100,
+    chaveLista: 'clientes_cadastro',
   });
+  const fornecedores = clientes.filter(c =>
+    (c.tags || []).some(t => (t.tag || '').toLowerCase().includes('fornecedor'))
+  );
+  console.log(`[OMIE] Fornecedores carregados: ${fornecedores.length} (de ${clientes.length} cadastros).`);
+  return fornecedores;
+}, CACHE_TTL_MS);
 
-  if (!melhor || melhorPontos < limiteSimilaridade) return null;
+const carregarFornecedoresCompleto = (forcar = false) => cacheFornecedores.obter(forcar);
 
-  return {
-    ncm: melhor.ncm.replace(/\D/g, ''),
-    origem: 'historico_omie',
-    descricaoNcm: melhor.descricao,
-    similaridade: Math.round(melhorPontos * 100),
-  };
-}
+const textoBusca = (s) => (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
 
-// ── Fornecedores ──────────────────────────────────────────────
-// Cache em memória dos fornecedores — mesmo padrão do catálogo de produtos
-let cacheFornecedores = null;
-let carregandoFornecedoresPromise = null;
-const CACHE_FORNECEDORES_TTL_MS = 30 * 60 * 1000;
-
-// Carrega todos os clientes/fornecedores do Omie (cadastro compartilhado)
-// e filtra só os marcados como fornecedor pela tag.
-async function carregarFornecedoresCompleto(forcarAtualizacao = false) {
-  const agora = Date.now();
-
-  if (!forcarAtualizacao && cacheFornecedores && (agora - cacheFornecedores.carregadoEm) < CACHE_FORNECEDORES_TTL_MS) {
-    return cacheFornecedores.fornecedores;
-  }
-
-  if (carregandoFornecedoresPromise) {
-    return carregandoFornecedoresPromise;
-  }
-
-  carregandoFornecedoresPromise = (async () => {
-    try {
-      let pagina = 1;
-      let totalPaginas = 1;
-      const todosClientes = [];
-
-      do {
-        console.log(`[OMIE] Buscando fornecedores — página ${pagina}${totalPaginas > 1 ? '/' + totalPaginas : ''}...`);
-        const resultado = await chamarOmie('ListarClientes', {
-          pagina,
-          registros_por_pagina: 100,
-          apenas_importado_api: 'N',
-        }, 'clientes');
-        const lista = resultado.clientes_cadastro || [];
-        todosClientes.push(...lista);
-
-        totalPaginas = resultado.total_de_paginas || 1;
-        pagina += 1;
-      } while (pagina <= totalPaginas);
-
-      // Filtra só os marcados como fornecedor pela tag
-      const fornecedores = todosClientes.filter(c => {
-        const tags = (c.tags || []).map(t => (t.tag || '').toLowerCase());
-        return tags.some(t => t.includes('fornecedor'));
-      });
-
-      cacheFornecedores = { fornecedores, carregadoEm: Date.now() };
-      console.log(`[OMIE] Fornecedores carregados: ${fornecedores.length} (de ${todosClientes.length} clientes/fornecedores totais).`);
-      return fornecedores;
-    } catch (err) {
-      console.error('[OMIE] Erro ao carregar fornecedores:', err.message);
-      throw err;
-    } finally {
-      carregandoFornecedoresPromise = null;
-    }
-  })();
-
-  return carregandoFornecedoresPromise;
-}
-
-// Busca fornecedores por texto (nome fantasia ou razão social) — usado
-// no campo de busca do modal de cotação, já que a lista completa pode
-// ser grande demais para mostrar de uma vez.
+// Busca por nome fantasia ou razão social (sem acento/caixa). Se algum
+// fornecedor bate EXATAMENTE com o texto, ele é retornado sozinho — assim
+// "RTE" não fica ambíguo só porque existe também "RTE Distribuidora".
 async function buscarFornecedoresPorTexto(texto, limite = 10) {
   const fornecedores = await carregarFornecedoresCompleto();
-  const termoBusca = (texto || '').toLowerCase().trim();
+  const termo = textoBusca(texto);
+  if (!termo) return fornecedores.slice(0, limite);
 
-  if (!termoBusca) return fornecedores.slice(0, limite);
+  const nomes = (f) => [textoBusca(f.nome_fantasia), textoBusca(f.razao_social)];
+  const exatos = fornecedores.filter(f => nomes(f).includes(termo));
+  if (exatos.length === 1) return exatos;
 
   return fornecedores
-    .filter(f => {
-      const nomeFantasia = (f.nome_fantasia || '').toLowerCase();
-      const razaoSocial  = (f.razao_social  || '').toLowerCase();
-      return nomeFantasia.includes(termoBusca) || razaoSocial.includes(termoBusca);
-    })
+    .filter(f => nomes(f).some(n => n.includes(termo)))
     .slice(0, limite);
 }
 
-// ── Condições de pagamento ───────────────────────────────────
-let cacheCondicoesPagamento = null;
-const CACHE_CONDICOES_TTL_MS = 30 * 60 * 1000;
+// ── Condições de pagamento (reservado para mapear cCodParc no futuro) ─
+const cacheCondicoes = criarCacheAssincrono(async () => {
+  const resultado = await chamarOmie('ListarFormasPagCompras', { pagina: 1, registros_por_pagina: 100 }, 'condicoes', { tentativas: 2 });
+  return resultado.cadastros || [];
+}, CACHE_TTL_MS);
 
-async function listarCondicoesPagamento(forcarAtualizacao = false) {
-  const agora = Date.now();
-
-  if (!forcarAtualizacao && cacheCondicoesPagamento && (agora - cacheCondicoesPagamento.carregadoEm) < CACHE_CONDICOES_TTL_MS) {
-    return cacheCondicoesPagamento.condicoes;
-  }
-
+async function listarCondicoesPagamento(forcar = false) {
   try {
-    const resultado = await chamarOmie('ListarFormasPagCompras', {
-      pagina: 1,
-      registros_por_pagina: 100,
-    }, 'condicoes');
-    const condicoes = resultado.cadastros || [];
-    cacheCondicoesPagamento = { condicoes, carregadoEm: agora };
-    console.log(`[OMIE] Condições de pagamento carregadas: ${condicoes.length}`);
-    return condicoes;
+    return await cacheCondicoes.obter(forcar);
   } catch (err) {
     console.error('[OMIE] Erro ao carregar condições de pagamento:', err.message);
     return [];
   }
 }
 
-// ── Pedido de Compra ─────────────────────────────────────────
-const OMIE_COD_CC      = 9964712606; // Itaú Unibanco
-const OMIE_COD_CATEG   = '2.01.03';  // Compras de Matéria Prima
+// ── Contador VN ──────────────────────────────────────────────
+// Mantido em memória; inicializado a partir do maior "VN nnnn" do catálogo.
+// A promise singleton evita que duas inicializações simultâneas
+// sobrescrevam o contador depois de ele já ter sido incrementado.
+let contadorVN = null;
+let inicializandoVN = null;
 
-// Formata data para o padrão do Omie: DD/MM/YYYY
+function inicializarContadorVN() {
+  if (contadorVN !== null) return Promise.resolve(contadorVN);
+  if (!inicializandoVN) {
+    inicializandoVN = (async () => {
+      try {
+        const catalogo = await carregarCatalogoCompleto();
+        const vns = catalogo
+          .map(p => (p.codigo || '').trim())
+          .filter(c => /^VN\s*\d{1,4}$/i.test(c)) // ignora outliers como "VN 9500001"
+          .map(c => parseInt(c.replace(/\D/g, ''), 10));
+        contadorVN = vns.length > 0 ? Math.max(...vns) : VN_INICIO;
+        console.log(`[OMIE] Contador VN inicializado em: ${contadorVN}`);
+      } catch (err) {
+        contadorVN = VN_INICIO;
+        console.warn(`[OMIE] Não foi possível inicializar contador VN pelo Omie, usando ${VN_INICIO}:`, err.message);
+      } finally {
+        inicializandoVN = null;
+      }
+      return contadorVN;
+    })();
+  }
+  return inicializandoVN;
+}
+
+const ehProdutoNaoEncontrado = (msg) => /n[aã]o (encontrad|cadastrad)|PROD_NAO_ENCONTRADO/i.test(msg);
+
+async function verificarCodigoExiste(codigo) {
+  try {
+    await chamarOmie('ConsultarProduto', { codigo }, 'produtos', { tentativas: 2 });
+    return true;
+  } catch (err) {
+    if (!ehProdutoNaoEncontrado(err.message)) {
+      // Erro inesperado: segue como "não existe" — se o código já existir,
+      // o próprio IncluirProduto recusa e o comprador é avisado.
+      console.warn(`[OMIE] Não foi possível confirmar se ${codigo} existe:`, err.message);
+    }
+    return false;
+  }
+}
+
+async function gerarProximoCodigoVN(maxTentativas = 5) {
+  await inicializarContadorVN();
+  for (let i = 0; i < maxTentativas; i++) {
+    contadorVN += 1; // incremento síncrono: chamadas concorrentes recebem números distintos
+    const codigo = `VN ${contadorVN}`;
+    if (!(await verificarCodigoExiste(codigo))) return codigo;
+    console.log(`[OMIE] Código ${codigo} já existe, tentando próximo...`);
+  }
+  throw new Error(`Não foi possível gerar um código VN disponível após ${maxTentativas} tentativas.`);
+}
+
+// Cadastra produto novo. Nunca lança: retorna { ok: true, codigo, codigo_omie, descricao, ncm, unidade }
+// ou { ok: false, motivo, detalhe } para o bot avisar o comprador.
+async function incluirProduto({ descricao, ncm, unidade, observacao }) {
+  let codigo;
+  try {
+    codigo = await gerarProximoCodigoVN();
+    const resultado = await chamarOmie('IncluirProduto', {
+      codigo_produto_integracao: `REQ-${codigo.replace(/\s/g, '')}`,
+      codigo,
+      descricao,
+      unidade:      unidade || 'PC',
+      ncm:          ncm || '',
+      obs_internas: observacao || 'Cadastrado via sistema de requisições GZero',
+    });
+    invalidarCache();
+    console.log(`[OMIE] Produto cadastrado: ${codigo} — ${descricao}`);
+    return { ok: true, codigo, codigo_omie: resultado.codigo_produto, descricao, ncm: ncm || '', unidade };
+  } catch (err) {
+    const msg = err.message || '';
+    if (/descri[cç][aã]o.*utilizad/i.test(msg)) {
+      console.warn(`[OMIE] Descrição já cadastrada: "${descricao}" — produto não criado.`);
+      return { ok: false, motivo: 'descricao_duplicada', detalhe: msg };
+    }
+    console.error(`[OMIE] Erro ao incluir produto "${descricao}" (${codigo || 'sem código'}):`, msg);
+    return { ok: false, motivo: 'erro_omie', detalhe: msg };
+  }
+}
+
+// ── Pedido de compra ─────────────────────────────────────────
 function formatarDataOmie(data) {
   const d = String(data.getDate()).padStart(2, '0');
   const m = String(data.getMonth() + 1).padStart(2, '0');
-  const y = data.getFullYear();
-  return `${d}/${m}/${y}`;
+  return `${d}/${m}/${data.getFullYear()}`;
 }
 
-// O Omie limita cCodIntPed a 20 caracteres. Preserva IDs curtos e usa um
-// sufixo determinístico para evitar colisões quando for necessário truncar.
+// O Omie limita códigos de integração a 20 caracteres. Mantém IDs curtos e
+// usa sufixo determinístico (hash) quando precisa truncar.
 function limitarCodigoIntegracao(original) {
   if (original.length <= 20) return original;
-
   const hash = crypto.createHash('sha1').update(original).digest('hex').slice(0, 6);
   return `${original.slice(0, 13)}-${hash}`;
 }
 
-function gerarCodigoIntegracaoPedido(idRequisicao, idxGrupo) {
-  return limitarCodigoIntegracao(`${idRequisicao}-G${idxGrupo + 1}`);
+// `lote` diferencia novas tentativas da mesma requisição (ex.: refazer a
+// cotação dos itens que falharam) — sem ele o Omie recusaria o cCodIntPed repetido.
+function gerarCodigoIntegracaoPedido(idRequisicao, idxGrupo, lote = '') {
+  return limitarCodigoIntegracao(`${idRequisicao}-${lote}G${idxGrupo + 1}`);
 }
 
-// Cria um pedido de compra no Omie para um grupo de fornecedor.
-// Retorna { nCodPed, cNumero } em caso de sucesso.
-async function incluirPedidoCompra({ idRequisicao, grupo, idxGrupo }) {
+function validarCodigoInterno(valor, descricao) {
+  const numero = Number(valor);
+  if (!Number.isFinite(numero) || numero <= 0) {
+    throw new Error(`${descricao} sem código interno válido no Omie`);
+  }
+  return numero;
+}
+
+async function incluirPedidoCompra({ idRequisicao, grupo, idxGrupo, lote = '' }) {
   const { fornecedor, prazo, condicao_descricao, itens, obs } = grupo;
 
-  // Data de previsão = hoje + prazo em dias
+  const nCodFor = validarCodigoInterno(fornecedor.codigo, `Fornecedor "${fornecedor.nome_fantasia || ''}"`);
+  const produtos = itens.map(item => ({
+    item,
+    nCodProd: validarCodigoInterno(item.codigo_omie, `Produto "${item.descricao || item.id_item}"`),
+  }));
+
   const dtPrevisao = new Date();
-  dtPrevisao.setDate(dtPrevisao.getDate() + (parseInt(prazo) || 0));
+  dtPrevisao.setDate(dtPrevisao.getDate() + (parseInt(prazo, 10) || 0));
+  const cCodIntPed = gerarCodigoIntegracaoPedido(idRequisicao, idxGrupo, lote);
 
-  // Código de integração único para o pedido
-  const cCodIntPed = gerarCodigoIntegracaoPedido(idRequisicao, idxGrupo);
-
-  const codigoFornecedor = Number(fornecedor.codigo);
-  if (!Number.isFinite(codigoFornecedor) || codigoFornecedor <= 0) {
-    throw new Error(`Fornecedor sem código interno válido no Omie: ${fornecedor.nome_fantasia || ''}`);
-  }
-
-  for (const item of itens) {
-    const codigoProduto = Number(item.codigo_omie);
-    if (!Number.isFinite(codigoProduto) || codigoProduto <= 0) {
-      throw new Error(`Produto sem código interno válido no Omie: ${item.descricao || item.id_item}`);
-    }
-  }
-
-  const param = {
+  const resultado = await chamarOmie('IncluirPedCompra', {
     cabecalho_incluir: {
       cCodIntPed,
-      dDtPrevisao:  formatarDataOmie(dtPrevisao),
-      cCodParc:     '999',   // À vista — Fernando define a condição em texto livre,
-                              // mas o Omie exige um código. 999 = à vista padrão.
-      nQtdeParc:    1,
-      cCodCateg:    OMIE_COD_CATEG,
-      nCodFor:      codigoFornecedor,
-      nCodCC:       OMIE_COD_CC,
-      cObs:         obs || `Requisição ${idRequisicao} — ${condicao_descricao}`,
-      cObsInt:      `Criado automaticamente via sistema de requisições GZero`,
+      dDtPrevisao: formatarDataOmie(dtPrevisao),
+      cCodParc:    '999', // o Omie exige um código; a condição real vai no texto da observação
+      nQtdeParc:   1,
+      cCodCateg:   OMIE_COD_CATEG,
+      nCodFor,
+      nCodCC:      OMIE_COD_CC,
+      cObs:        obs || `Requisição ${idRequisicao} — ${condicao_descricao}`,
+      cObsInt:     'Criado automaticamente via sistema de requisições GZero',
     },
-    produtos_incluir: itens.map((item, idx) => ({
+    produtos_incluir: produtos.map(({ item, nCodProd }, idx) => ({
       cCodIntItem: limitarCodigoIntegracao(`${cCodIntPed}-I${idx + 1}`),
-      nCodProd:    Number(item.codigo_omie),
+      nCodProd,
       cUnidade:    item.unidade,
       nQtde:       item.quantidade,
       nValUnit:    item.preco_unitario,
       nDesconto:   0,
       cObs:        item.descricao,
     })),
-  };
-
-  const resultado = await chamarOmie('IncluirPedCompra', param, 'pedidocompra');
+  }, 'pedidocompra');
 
   console.log(`[OMIE] Pedido criado: ${resultado.cNumero} (nCodPed: ${resultado.nCodPed}) — ${fornecedor.nome_fantasia}`);
   return { nCodPed: resultado.nCodPed, cNumero: resultado.cNumero, cCodIntPed };
 }
 
 module.exports = {
+  chamarOmie,
   carregarCatalogoCompleto,
   invalidarCache,
-  buscarNcmPorHistorico,
-  listarProdutosPagina,
   incluirProduto,
   inicializarContadorVN,
-  buscarFornecedoresPorTexto,
   carregarFornecedoresCompleto,
+  buscarFornecedoresPorTexto,
   listarCondicoesPagamento,
   incluirPedidoCompra,
+  gerarCodigoIntegracaoPedido,
+  limitarCodigoIntegracao,
 };
-  

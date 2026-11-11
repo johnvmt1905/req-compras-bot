@@ -1,7 +1,7 @@
 # GZero — Backend Requisição de Compras
 
 ## Pré-requisitos
-- Node.js v22+
+- Node.js v20+
 - Conta no Slack com app configurado
 - ngrok (para testes locais)
 
@@ -87,25 +87,51 @@ curl -X POST http://localhost:3000/requisicao \
   }'
 ```
 
+## Testes
+
+```bash
+npm test
+```
+
+Roda testes unitários e uma simulação do fluxo completo no Slack (revisão → cadastro → cotação → pedido) com Slack, Omie e Sheets substituídos por fakes — não toca em nenhum sistema real.
+
 ## Estrutura do projeto
 
 ```
 src/
-├── server.js          → Express + endpoint /requisicao
-├── slack/
-│   └── bot.js         → Bolt, mensagens e modais
+├── server.js            → Express: /health, /requisicao, /requisicao-teste
+├── config/
+│   └── environment.js   → canal/planilha por ambiente + validação do .env
+├── utils/
+│   └── cache.js         → TtlMap, cache assíncrono, lock, concorrência
 ├── services/
-│   ├── normalizer.js  → Normalização de descrição
-│   ├── matcher.js     → Similaridade (fuse.js)
-│   └── sheets.js      → Google Sheets API
-└── mock/
-    └── produtos.js    → Catálogo fake para testes sem Omie
+│   ├── normalizer.js    → normalização de descrições
+│   ├── matcher.js       → similaridade (fuse.js) com índice do catálogo em cache
+│   ├── ncmService.js    → sugestão de NCM pela tabela local (src/data/ncm.json)
+│   ├── omieService.js   → API Omie (catálogo, fornecedores, produto, pedido)
+│   └── sheets.js        → Google Sheets (abas Itens e Histórico)
+└── slack/
+    ├── bot.js           → ponto de entrada (registra os handlers)
+    ├── app.js           → instância do Bolt e caches em memória
+    ├── blocos.js        → Block Kit e montagem dos modais
+    ├── mensagens.js     → envio/edição da mensagem da requisição
+    ├── revisao.js       → fluxo de revisão de itens
+    └── cotacao.js       → fluxo de cotação e pedidos no Omie
 ```
 
-## Próximos passos
-- [ ] Configurar Google Sheets API (credentials.json)
-- [ ] Configurar ngrok e atualizar URL no Slack
-- [ ] Testar fluxo completo AT → Node → Slack → modal
-- [ ] Integrar Omie (substituir mock/produtos.js)
-- [ ] Deploy em servidor (Railway / Render)
+## Segurança do endpoint (opcional)
+Se `REQUISICAO_TOKEN` estiver no `.env`, o Apps Script precisa enviar o header
+`x-requisicao-token` com o mesmo valor:
+
+```js
+UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json',
+  headers: { 'x-requisicao-token': TOKEN }, payload: JSON.stringify(dados) });
 ```
+
+Sem a variável, o endpoint continua aberto como antes.
+
+## Próximos passos
+- [ ] Definir `REQUISICAO_TOKEN` e enviar o header no Apps Script
+- [ ] Mapear a condição de pagamento para o `cCodParc` do Omie (hoje vai fixo 999 + texto na observação)
+- [ ] Deploy em servidor (Railway / Render) usando `GOOGLE_CREDENTIALS_JSON`
+

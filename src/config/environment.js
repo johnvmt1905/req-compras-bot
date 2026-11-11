@@ -1,3 +1,6 @@
+// Configuração por ambiente. Produção e teste compartilham o mesmo fluxo,
+// mas usam canal do Slack e planilha separados.
+
 const AMBIENTE_PRODUCAO = 'producao';
 const AMBIENTE_TESTE = 'teste';
 
@@ -6,8 +9,7 @@ function normalizarAmbiente(ambiente) {
 }
 
 function configuracaoAmbiente(ambiente) {
-  const normalizado = normalizarAmbiente(ambiente);
-  if (normalizado === AMBIENTE_TESTE) {
+  if (normalizarAmbiente(ambiente) === AMBIENTE_TESTE) {
     return {
       ambiente: AMBIENTE_TESTE,
       teste: true,
@@ -26,4 +28,39 @@ function configuracaoAmbiente(ambiente) {
   };
 }
 
-module.exports = { AMBIENTE_PRODUCAO, AMBIENTE_TESTE, normalizarAmbiente, configuracaoAmbiente };
+// Mensagens antigas do Slack não carregam o ambiente no botão — deduz pelo
+// canal onde a mensagem foi postada.
+function ambienteDoCanal(channelId) {
+  return channelId && channelId === configuracaoAmbiente(AMBIENTE_TESTE).slackChannelId
+    ? AMBIENTE_TESTE
+    : AMBIENTE_PRODUCAO;
+}
+
+const VARIAVEIS_OBRIGATORIAS = [
+  'SLACK_BOT_TOKEN',
+  'SLACK_SIGNING_SECRET',
+  'SLACK_CHANNEL_ID',
+  'SHEETS_SPREADSHEET_ID',
+  'OMIE_APP_KEY',
+  'OMIE_APP_SECRET',
+];
+
+// Avisa no startup sobre configuração faltando, em vez de o erro aparecer
+// só no meio de uma requisição real.
+function validarConfiguracao() {
+  const faltando = VARIAVEIS_OBRIGATORIAS.filter(v => !process.env[v]);
+  if (!process.env.GOOGLE_CREDENTIALS_JSON && !process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    faltando.push('GOOGLE_CREDENTIALS_JSON ou GOOGLE_APPLICATION_CREDENTIALS');
+  }
+  faltando.forEach(v => console.warn(`[CONFIG] Variável de ambiente não configurada: ${v}`));
+  return faltando;
+}
+
+module.exports = {
+  AMBIENTE_PRODUCAO,
+  AMBIENTE_TESTE,
+  normalizarAmbiente,
+  configuracaoAmbiente,
+  ambienteDoCanal,
+  validarConfiguracao,
+};
